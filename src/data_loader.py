@@ -31,6 +31,28 @@ def _get_required_dataset(data, key):
     except Exception as exc:
         raise DataQualityError(f'Failed to load required dataset {key}; no raw fallback') from exc
 
+def _normalize_option_table(raw):
+    """Normalize FinLab tw_option_put_call_ratio to a daily date-indexed numeric table."""
+    frame = pd.DataFrame(raw).copy()
+    required = [col for group in OPTION_COLUMNS.values() for col in group]
+
+    if 'date' not in frame.columns:
+        raise DataQualityError('Option dataset missing date column')
+    if not set(required).issubset(frame.columns):
+        raise DataQualityError(f'Option schema changed; expected {required}; got {list(frame.columns)}')
+
+    try:
+        dates = pd.to_datetime(frame['date'], errors='raise')
+    except (TypeError, ValueError) as exc:
+        raise DataQualityError('Option dataset contains malformed date values') from exc
+
+    if dates.isna().any():
+        raise DataQualityError('Option dataset contains malformed date values')
+
+    options = frame[required].copy()
+    options.index = pd.DatetimeIndex(dates, name='date')
+    return options
+
 def load_finlab():
     import finlab
     from finlab import data
@@ -47,11 +69,7 @@ def load_finlab():
         for key in (KEYS['adj_open'], KEYS['adj_close'])
     }
 
-    options = pd.DataFrame(_get_required_dataset(data, KEYS['options']))
-    required = [col for group in OPTION_COLUMNS.values() for col in group]
-    if not set(required).issubset(options.columns):
-        raise DataQualityError(f'Option schema changed; expected {required}; got {list(options.columns)}')
-    options = options[required]
+    options = _normalize_option_table(_get_required_dataset(data, KEYS['options']))
 
     series = {}
     for name in ('adj_open', 'adj_close', 'raw_open', 'raw_close'):

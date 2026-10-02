@@ -7,7 +7,7 @@ from src.config import Config, BINS, KEYS
 from src.data_loader import OPTION_COLUMNS, load_finlab, CredentialUnavailable
 from src.signals import build_signals, rolling_percentile, percentile_bins
 from src.outcomes import compute_outcomes
-from src.validation import validate_prices, normalize, DataQualityError
+from src.validation import validate_prices, validate_options, normalize, DataQualityError
 from src.statistics import hac_contrast
 from src.fdr import bh, apply_fdr
 from src.annual_analysis import annual_cells, annual_summary
@@ -126,9 +126,16 @@ def _install_fake_finlab(monkeypatch, datasets, search_result=None, failing_key=
     monkeypatch.setitem(sys.modules,'finlab',module)
     return calls
 
+def _live_like_options():
+    f=options().reset_index(names='date')
+    f.insert(0,'symbol','TXO')
+    f.insert(2,'key_date',pd.Timestamp('2026-01-01 10:00:00'))
+    f['stock_id']='TXO'
+    return f
+
 def _loader_datasets():
-    option_frame=options()
-    idx=option_frame.index
+    option_frame=_live_like_options()
+    idx=pd.DatetimeIndex(option_frame['date'])
     price_frame=pd.DataFrame({'0050':np.arange(len(idx),dtype=float)+100},index=idx)
     return {
         KEYS['options']:option_frame,
@@ -142,10 +149,48 @@ def test_finlab_search_series_is_diagnostic_only(monkeypatch):
     datasets=_loader_datasets()
     calls=_install_fake_finlab(monkeypatch,datasets,pd.Series(['etl:adj_open'],name='dataset'))
     monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
-    _,prices_frame,_,available=load_finlab()
+    options_frame,prices_frame,_,available=load_finlab()
+    assert isinstance(options_frame.index,pd.DatetimeIndex)
+    assert options_frame.index.name=='date'
+    assert list(options_frame.columns)==[col for group in OPTION_COLUMNS.values() for col in group]
     assert list(prices_frame.columns)==['adj_open','adj_close','raw_open','raw_close']
     assert KEYS['adj_open'] in calls and KEYS['adj_close'] in calls
     assert available[KEYS['adj_open']]==['etl:adj_open']
+
+def test_finlab_option_date_column_is_signal_date(monkeypatch):
+    datasets=_loader_datasets()
+    raw=datasets[KEYS['options']]
+    raw['key_date']=pd.Timestamp('2099-01-01 12:34:56')
+    _install_fake_finlab(monkeypatch,datasets)
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    options_frame,_,_,_=load_finlab()
+    assert options_frame.index.equals(pd.DatetimeIndex(raw['date'],name='date'))
+    assert options_frame.index.max().year!=2099
+
+def test_finlab_option_missing_date_is_fatal(monkeypatch):
+    datasets=_loader_datasets()
+    datasets[KEYS['options']]=datasets[KEYS['options']].drop(columns='date')
+    _install_fake_finlab(monkeypatch,datasets)
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    with pytest.raises(DataQualityError,match='missing date column'):
+        load_finlab()
+
+def test_finlab_option_malformed_date_is_fatal(monkeypatch):
+    datasets=_loader_datasets()
+    datasets[KEYS['options']].loc[0,'date']='not-a-date'
+    _install_fake_finlab(monkeypatch,datasets)
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    with pytest.raises(DataQualityError,match='malformed date'):
+        load_finlab()
+
+def test_finlab_option_duplicate_date_fails_validation(monkeypatch):
+    datasets=_loader_datasets()
+    datasets[KEYS['options']].loc[1,'date']=datasets[KEYS['options']].loc[0,'date']
+    _install_fake_finlab(monkeypatch,datasets)
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    options_frame,_,_,_=load_finlab()
+    with pytest.raises(DataQualityError,match='duplicate dates'):
+        validate_options(options_frame)
 
 def test_finlab_missing_0050_is_fatal(monkeypatch):
     datasets=_loader_datasets()
