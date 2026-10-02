@@ -1,3 +1,5 @@
+import sys
+import types
 import numpy as np
 import pandas as pd
 import pytest
@@ -107,6 +109,59 @@ def test_credential_block(monkeypatch):
     monkeypatch.delenv('FINLAB_API_TOKEN',raising=False)
     with pytest.raises(CredentialUnavailable) as e:load_finlab()
     assert e.value.status=='DATA_VALIDATION_BLOCKED_BY_CREDENTIAL'
+
+def _install_fake_finlab(monkeypatch, datasets, search_result=None, failing_key=None):
+    calls=[]
+    class FakeData:
+        def search(self, key):
+            return pd.Series([key], name='dataset') if search_result is None else search_result
+        def get(self, key):
+            calls.append(key)
+            if key==failing_key:
+                raise RuntimeError('simulated get failure')
+            return datasets[key]
+    module=types.ModuleType('finlab')
+    module.data=FakeData()
+    module.login=lambda token: None
+    monkeypatch.setitem(sys.modules,'finlab',module)
+    return calls
+
+def _loader_datasets():
+    option_frame=options()
+    idx=option_frame.index
+    price_frame=pd.DataFrame({'0050':np.arange(len(idx),dtype=float)+100},index=idx)
+    return {
+        KEYS['options']:option_frame,
+        KEYS['adj_open']:price_frame+1,
+        KEYS['adj_close']:price_frame+2,
+        KEYS['raw_open']:price_frame+3,
+        KEYS['raw_close']:price_frame+4,
+    }
+
+def test_finlab_search_series_is_diagnostic_only(monkeypatch):
+    datasets=_loader_datasets()
+    calls=_install_fake_finlab(monkeypatch,datasets,pd.Series(['etl:adj_open'],name='dataset'))
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    _,prices_frame,_,available=load_finlab()
+    assert list(prices_frame.columns)==['adj_open','adj_close','raw_open','raw_close']
+    assert KEYS['adj_open'] in calls and KEYS['adj_close'] in calls
+    assert available[KEYS['adj_open']]==['etl:adj_open']
+
+def test_finlab_missing_0050_is_fatal(monkeypatch):
+    datasets=_loader_datasets()
+    datasets[KEYS['adj_open']]=datasets[KEYS['adj_open']].rename(columns={'0050':'OTHER'})
+    _install_fake_finlab(monkeypatch,datasets)
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    with pytest.raises(DataQualityError,match='0050 missing'):
+        load_finlab()
+
+def test_finlab_required_get_failure_has_no_raw_fallback(monkeypatch):
+    datasets=_loader_datasets()
+    calls=_install_fake_finlab(monkeypatch,datasets,failing_key=KEYS['adj_open'])
+    monkeypatch.setenv('FINLAB_API_TOKEN','test-token')
+    with pytest.raises(DataQualityError,match='Failed to load required dataset'):
+        load_finlab()
+    assert KEYS['raw_open'] not in calls and KEYS['raw_close'] not in calls
 
 def test_archive_no_overwrite(tmp_path):
     run=tmp_path/'run';run.mkdir();(run/'result').write_text('ok')
